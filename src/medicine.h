@@ -2,17 +2,20 @@
 #define MEDICINE_H
 
 #define MAX_MED 1000
+#define NAME_LEN 80
+#define TREAT_LEN 80
+
 typedef struct {
-    char name[80];
-    char treatment[80];
+    char name[NAME_LEN];
+    char treatment[TREAT_LEN];
     int quantity;
     float price;
-    int day, month, year;
-    int shelf, row;
-    int id;
+    int day, month, year;  // expiry date
+    int shelf, row;        // location
+    int id;                // unique ID
 } Medicine;
 
-/* Function prototypes */
+/* Medicine management functions */
 void addMedicine();
 void displayAll();
 int searchMedicineByName(const char *name);
@@ -24,4 +27,3 @@ void showShelfLocation();
 void searchByTreatment();
 
 #endif
-
