@@ -1,0 +1,503 @@
+/************************************************************
+ * PharmaTrack v5 � Shorter, cleaner, sales log + total_sold
+ * Compile: gcc -std=c99 -Wall -O2 pharmatrack_v5.c -o pharmatrack
+ ************************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <time.h>
+
+#define DATA_FILE "pharmatrack.dat"
+#define USER_FILE "users.txt"
+#define SALES_FILE "sales.txt"
+
+#define NAME_LEN 80
+#define GENERIC_LEN 80
+#define TREAT_LEN 160
+#define TYPE_LEN 40
+#define BARCODE_LEN 40
+#define INITIAL_CAP 64
+#define SCREEN_W 60
+#define LOW_STOCK_THRESHOLD 5
+#define EXPIRY_SOON_DAYS 30
+#define MAX_USERS 100
+
+/* ---------------- Data structures ---------------- */
+typedef struct {
+    char username[48];
+    char password[48];
+} User;
+
+typedef struct {
+    char name[NAME_LEN];      /* stored lowercase for canonical comparison */
+    char generic[GENERIC_LEN];
+    char treatment[TREAT_LEN];
+    char type[TYPE_LEN];
+    char barcode[BARCODE_LEN];
+    int quantity;
+    float price;
+    int day, month, year;     /* expiry */
+    int shelf, row;
+    int id;
+    int total_sold;           /* new */
+} Medicine;
+
+/* ---------------- Globals ---------------- */
+static Medicine *meds = NULL;
+static int med_count = 0, med_cap = 0;
+static int next_id = 1;
+
+static User users[MAX_USERS];
+static int user_count = 0;
+
+/* ---------------- Utility ---------------- */
+void clear_screen() {
+#ifdef _WIN32
+    system("cls");
+#else
+    system("clear");
+#endif
+}
+
+void pause_here() {
+    printf("\n        Press ENTER to continue...");
+    while (getchar() != '\n') {}
+}
+
+void safe_fgets(char *buf, int n) {
+    if (!fgets(buf, n, stdin)) { buf[0] = '\0'; return; }
+    size_t ln = strcspn(buf, "\n"); buf[ln] = '\0';
+}
+
+void to_lower_inplace(char *s) {
+    for (; *s; ++s) *s = (char)tolower((unsigned char)*s);
+}
+
+int portable_strcasecmp(const char *a, const char *b) {
+    for (;; a++, b++) {
+        int ca = tolower((unsigned char)*a);
+        int cb = tolower((unsigned char)*b);
+        if (ca != cb) return ca - cb;
+        if (!ca) return 0;
+    }
+}
+
+/* robust integer prompt */
+int get_int(const char *prompt) {
+    char line[128];
+    while (1) {
+        printf("%s", prompt);
+        safe_fgets(line, sizeof(line));
+        if (line[0] == '\0') { printf("        Input required.\n"); continue; }
+        char *end; long v = strtol(line, &end, 10);
+        if (*end != '\0') { printf("        Invalid integer.\n"); continue; }
+        return (int)v;
+    }
+}
+
+float get_float(const char *prompt) {
+    char line[128];
+    while (1) {
+        printf("%s", prompt);
+        safe_fgets(line, sizeof(line));
+        if (line[0] == '\0') { printf("        Input required.\n"); continue; }
+        char *end; double v = strtod(line, &end);
+        if (*end != '\0') { printf("        Invalid number.\n"); continue; }
+        return (float)v;
+    }
+}
+
+/* ---------------- Storage ---------------- */
+void ensure_med_capacity() {
+    if (!meds) {
+        med_cap = INITIAL_CAP;
+        meds = malloc(sizeof(Medicine) * med_cap);
+        if (!meds) { perror("malloc"); exit(1); }
+    } else if (med_count >= med_cap) {
+        med_cap *= 2;
+        Medicine *tmp = realloc(meds, sizeof(Medicine) * med_cap);
+        if (!tmp) { perror("realloc"); exit(1); }
+        meds = tmp;
+    }
+}
+
+void save_data() {
+    FILE *f = fopen(DATA_FILE, "wb");
+    if (!f) return;
+    fwrite(&med_count, sizeof(int), 1, f);
+    fwrite(&next_id, sizeof(int), 1, f);
+    if (med_count > 0) fwrite(meds, sizeof(Medicine), med_count, f);
+    fclose(f);
+}
+
+void load_data() {
+    FILE *f = fopen(DATA_FILE, "rb");
+    if (!f) return;
+    int cnt = 0, nid = 1;
+    if (fread(&cnt, sizeof(int), 1, f) == 1 && fread(&nid, sizeof(int), 1, f) == 1) {
+        if (cnt > 0) {
+            med_cap = INITIAL_CAP;
+            while (med_cap < cnt) med_cap *= 2;
+            meds = malloc(sizeof(Medicine) * med_cap);
+            if (!meds) { perror("malloc"); fclose(f); exit(1); }
+            size_t got = fread(meds, sizeof(Medicine), cnt, f);
+            med_count = (int)got;
+        }
+        next_id = nid;
+    }
+    fclose(f);
+}
+
+void save_users() {
+    FILE *f = fopen(USER_FILE, "w");
+    if (!f) return;
+    for (int i = 0; i < user_count; ++i) {
+        fprintf(f, "%s %s\n", users[i].username, users[i].password);
+    }
+    fclose(f);
+}
+
+void load_users() {
+    FILE *f = fopen(USER_FILE, "r");
+    if (!f) return;
+    while (user_count < MAX_USERS && fscanf(f, "%47s %47s", users[user_count].username, users[user_count].password) == 2) {
+        user_count++;
+    }
+    fclose(f);
+}
+
+/* ---------------- Date helpers ---------------- */
+int days_to_expiry(int d, int m, int y) {
+    struct tm exp = {0};
+    exp.tm_mday = d; exp.tm_mon = m - 1; exp.tm_year = y - 1900;
+    time_t texp = mktime(&exp);
+    if (texp == (time_t)-1) return INT_MIN;
+    time_t now = time(NULL);
+    double diff = difftime(texp, now);
+    return (int)(diff / (60*60*24));
+}
+
+int is_expired(const Medicine *md) {
+    return days_to_expiry(md->day, md->month, md->year) < 0;
+}
+
+/* ---------------- Core operations ---------------- */
+int find_med_index_by_name(const char *name) {
+    if (!name || name[0] == '\0') return -1;
+    for (int i = 0; i < med_count; ++i) {
+        if (portable_strcasecmp(meds[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+void add_medicine() {
+    clear_screen();
+    printf("\n");
+    for (int i=0;i<SCREEN_W;i++) putchar('=');
+    printf("\n        ADD NEW MEDICINE\n");
+    for (int i=0;i<SCREEN_W;i++) putchar('=');
+    printf("\n\n");
+    ensure_med_capacity();
+    Medicine m; memset(&m, 0, sizeof(m));
+
+    char tmp[NAME_LEN];
+    printf("        Brand name: "); safe_fgets(tmp, sizeof(tmp));
+    if (tmp[0] == '\0') { printf("        Cancelled.\n"); pause_here(); return; }
+    to_lower_inplace(tmp);
+    if (find_med_index_by_name(tmp) != -1) { printf("        Already exists.\n"); pause_here(); return; }
+    strncpy(m.name, tmp, NAME_LEN-1);
+
+    printf("        Generic name: "); safe_fgets(m.generic, sizeof(m.generic));
+    printf("        Treatment/category: "); safe_fgets(m.treatment, sizeof(m.treatment));
+    printf("        Type (Tablet/Syrup): "); safe_fgets(m.type, sizeof(m.type));
+    m.quantity = get_int("        Quantity: ");
+    m.price = get_float("        Price: ");
+    printf("        Expiry (DD MM YYYY): ");
+    while (scanf("%d %d %d", &m.day, &m.month, &m.year) != 3) {
+        int c; while ((c=getchar())!='\n' && c!=EOF) {}
+        printf("        Invalid. Enter DD MM YYYY: ");
+    }
+    int c; while ((c=getchar())!='\n' && c!=EOF) {}
+    m.shelf = get_int("        Shelf number: ");
+    m.row = get_int("        Row number: ");
+    printf("        Barcode: "); safe_fgets(m.barcode, sizeof(m.barcode));
+
+    m.id = next_id++;
+    m.total_sold = 0;
+    meds[med_count++] = m;
+    save_data();
+    printf("\n        Added '%s' (ID %d).\n", m.name, m.id);
+    pause_here();
+}
+
+void update_medicine() {
+    clear_screen();
+    printf("\n        UPDATE MEDICINE\n\n");
+    char name[NAME_LEN];
+    printf("        Enter brand name to update: "); safe_fgets(name, sizeof(name));
+    to_lower_inplace(name);
+    int idx = find_med_index_by_name(name);
+    if (idx == -1) { printf("        Not found.\n"); pause_here(); return; }
+    Medicine *m = &meds[idx];
+    printf("\n        Updating %s (ID %d)\n", m->name, m->id);
+    char line[128];
+    printf("        Current quantity: %d\n        New quantity (ENTER to keep): ", m->quantity);
+    safe_fgets(line, sizeof(line));
+    if (line[0] != '\0') { int v = atoi(line); if (v>=0) m->quantity = v; }
+
+    printf("        Current price: %.2f\n        New price (ENTER to keep): ", m->price);
+    safe_fgets(line, sizeof(line));
+    if (line[0] != '\0') { float fv = (float)atof(line); if (fv >= 0.0f) m->price = fv; }
+
+    save_data();
+    printf("\n        Updated.\n");
+    pause_here();
+}
+
+void delete_medicine() {
+    clear_screen();
+    printf("\n        DELETE MEDICINE\n\n");
+    char name[NAME_LEN];
+    printf("        Enter brand name to delete: "); safe_fgets(name, sizeof(name));
+    to_lower_inplace(name);
+    int idx = find_med_index_by_name(name);
+    if (idx == -1) { printf("        Not found.\n"); pause_here(); return; }
+    printf("        Confirm delete %s (y/N): ", meds[idx].name);
+    char confirm[8]; safe_fgets(confirm, sizeof(confirm));
+    if (portable_strcasecmp(confirm, "y") == 0 || portable_strcasecmp(confirm, "Y") == 0) {
+        for (int i = idx; i < med_count - 1; ++i) meds[i] = meds[i+1];
+        med_count--;
+        save_data();
+        printf("        Deleted.\n");
+    } else printf("        Cancelled.\n");
+    pause_here();
+}
+
+void display_inventory() {
+    clear_screen();
+    printf("\n        FULL INVENTORY\n\n");
+    if (med_count == 0) { printf("        No medicines.\n"); pause_here(); return; }
+
+    printf("        %-4s %-18s %-8s %-6s %-8s %-10s\n", "ID", "Name", "Type", "Qty", "Sold", "Expiry");
+    for (int i = 0; i < med_count; ++i) {
+        Medicine *m = &meds[i];
+        printf("        %-4d %-18s %-8s %-6d %-8d %02d-%02d-%04d\n",
+               m->id, m->name, m->type, m->quantity, m->total_sold, m->day, m->month, m->year);
+        if ((i+1) % 10 == 0 && (i+1) < med_count) pause_here();
+    }
+    pause_here();
+}
+
+/* Log a sale line into SALES_FILE */
+void log_sale(const Medicine *m, int qty, float total_price) {
+    FILE *f = fopen(SALES_FILE, "a");
+    if (!f) return;
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    char date[32];
+    snprintf(date, sizeof(date), "%02d-%02d-%04d", tm->tm_mday, tm->tm_mon+1, tm->tm_year+1900);
+    fprintf(f, "%s | %d | %.2f | %.2f | %s\n", m->name, qty, m->price, total_price, date);
+    fclose(f);
+}
+
+/* Billing flow is now invoked from view/search details */
+void perform_sale(Medicine *m) {
+    if (is_expired(m)) {
+        printf("\n        ERROR: %s is EXPIRED (%02d-%02d-%04d). Cannot sell.\n", m->name, m->day, m->month, m->year);
+        return;
+    }
+    printf("\n        Price/unit: %.2f | Available: %d\n", m->price, m->quantity);
+    int q = get_int("        Quantity to sell: ");
+    if (q <= 0) { printf("        Invalid quantity.\n"); return; }
+    if (q > m->quantity) { printf("        Not enough stock.\n"); return; }
+    float disc = get_float("        Seller discount %% (0-100): ");
+    if (disc < 0.0f || disc > 100.0f) { printf("        Invalid discount, set to 0.\n"); disc = 0.0f; }
+    float subtotal = q * m->price;
+    float discount = subtotal * (disc / 100.0f);
+    float total = subtotal - discount;
+    m->quantity -= q;
+    m->total_sold += q;
+    save_data();
+    log_sale(m, q, total);
+
+    printf("\n================ INVOICE ================\n");
+    printf("        Medicine: %s\n        Qty: %d @ %.2f\n", m->name, q, m->price);
+    if (discount > 0.0f) printf("        Discount: -%.2f\n", discount);
+    printf("        TOTAL: %.2f\n", total);
+    printf("=========================================\n");
+}
+
+/* Search + Details + Sell-from-details */
+void search_medicine() {
+    clear_screen();
+    printf("\n        SEARCH MEDICINE\n\n");
+    char name[NAME_LEN];
+    printf("        Enter brand name: "); safe_fgets(name, sizeof(name));
+    to_lower_inplace(name);
+    int idx = find_med_index_by_name(name);
+    if (idx == -1) { printf("\n        Not found.\n"); pause_here(); return; }
+    Medicine *m = &meds[idx];
+    printf("\n        %s (ID %d)\n", m->name, m->id);
+    printf("        Generic: %s\n        Type: %s\n        Qty: %d\n        Price: %.2f\n        Expiry: %02d-%02d-%04d\n        Location: Shelf %d Row %d\n        Total sold: %d\n",
+           m->generic, m->type, m->quantity, m->price, m->day, m->month, m->year, m->shelf, m->row, m->total_sold);
+
+    printf("\n        Do you want to SELL this medicine? (y/N): ");
+    char ans[8]; safe_fgets(ans, sizeof(ans));
+    if (portable_strcasecmp(ans, "y") == 0) {
+        perform_sale(m);
+    }
+    pause_here();
+}
+
+void view_shelf_location() {
+    clear_screen();
+    printf("\n        FIND SHELF LOCATION\n\n");
+    char name[NAME_LEN];
+    printf("        Enter brand name: "); safe_fgets(name, sizeof(name));
+    to_lower_inplace(name);
+    int idx = find_med_index_by_name(name);
+    if (idx == -1) { printf("        Not found.\n"); pause_here(); return; }
+    Medicine *m = &meds[idx];
+    printf("\n        '%s' -> Shelf %d, Row %d | Qty: %d\n", m->name, m->shelf, m->row, m->quantity);
+    pause_here();
+}
+
+/* View sales file */
+void view_sales() {
+    clear_screen();
+    printf("\n        SALES LOG\n\n");
+    FILE *f = fopen(SALES_FILE, "r");
+    if (!f) { printf("        No sales yet.\n"); pause_here(); return; }
+    char line[256];
+    int printed = 0;
+    while (fgets(line, sizeof(line), f)) {
+        printf("        %s", line);
+        printed++;
+        if (printed % 15 == 0) pause_here();
+    }
+    fclose(f);
+    if (printed == 0) printf("        No sales yet.\n");
+    pause_here();
+}
+
+/* Admin/user functions (simplified) */
+int login() {
+    clear_screen();
+    printf("\n        LOGIN\n\n");
+    char u[48], p[48];
+    printf("        Username: "); safe_fgets(u, sizeof(u));
+    printf("        Password: "); safe_fgets(p, sizeof(p));
+    for (int i = 0; i < user_count; ++i) {
+        if (strcmp(users[i].username, u) == 0 && strcmp(users[i].password, p) == 0) return 1;
+    }
+    printf("\n        Invalid credentials.\n");
+    pause_here();
+    return 0;
+}
+
+void register_user() {
+    clear_screen();
+    printf("\n        REGISTER\n\n");
+    if (user_count >= MAX_USERS) { printf("        User limit reached.\n"); pause_here(); return; }
+    char u[48], p[48];
+    printf("        New username: "); safe_fgets(u, sizeof(u));
+    for (int i=0;i<user_count;i++) if (strcmp(users[i].username, u) == 0) { printf("        Exists.\n"); pause_here(); return; }
+    printf("        New password: "); safe_fgets(p, sizeof(p));
+    if (u[0]==0 || p[0]==0) { printf("        Empty not allowed.\n"); pause_here(); return; }
+    strcpy(users[user_count].username, u); strcpy(users[user_count].password, p); user_count++;
+    save_users();
+    printf("        Registered.\n"); pause_here();
+}
+
+void forgot_password() {
+    clear_screen();
+    printf("\n        FORGOT PASSWORD\n\n");
+    char u[48];
+    printf("        Username: "); safe_fgets(u, sizeof(u));
+    for (int i = 0; i < user_count; ++i) {
+        if (strcmp(users[i].username, u) == 0) { printf("\n        Password: %s\n", users[i].password); pause_here(); return; }
+    }
+    printf("\n        Username not found.\n"); pause_here();
+}
+
+/* Status summary for dashboard */
+void show_status_banner() {
+    int low = 0, expiring = 0;
+    for (int i = 0; i < med_count; ++i) {
+        if (meds[i].quantity <= LOW_STOCK_THRESHOLD) low++;
+        int days = days_to_expiry(meds[i].day, meds[i].month, meds[i].year);
+        if (days < 0 || days <= EXPIRY_SOON_DAYS) expiring++;
+    }
+    for (int i=0;i<SCREEN_W;i++) putchar('-'); printf("\n");
+    printf("        Total types: %d\n", med_count);
+    printf("        Stock status: %s\n", low ? "LOW" : "OK");
+    printf("        Expiry status: %s\n", expiring ? "RISK" : "SAFE");
+    for (int i=0;i<SCREEN_W;i++) putchar('-'); printf("\n\n");
+}
+
+/* ---------------- Menus ---------------- */
+void main_menu() {
+    while (1) {
+        clear_screen();
+        printf("\n");
+        for (int i=0;i<SCREEN_W;i++) putchar('='); printf("\n        PHARMA TRACK (v5)\n");
+        for (int i=0;i<SCREEN_W;i++) putchar('='); printf("\n\n");
+        show_status_banner();
+        printf("        1. Add New Medicine\n");
+        printf("        2. Update Medicine\n");
+        printf("        3. Delete Medicine\n");
+        printf("        4. Display Full Inventory\n");
+        printf("        5. Search & Sell Medicine\n");
+        printf("        6. Find Shelf Location\n");
+        printf("        7. View Sales Log\n");
+        printf("        0. Save & Exit\n\n");
+        printf("        Enter choice: ");
+        int choice;
+        if (scanf("%d", &choice) != 1) { int c; while ((c=getchar())!='\n' && c!=EOF) {} choice = -1; }
+        int c; while ((c=getchar())!='\n' && c!=EOF) {}
+        switch (choice) {
+            case 1: add_medicine(); break;
+            case 2: update_medicine(); break;
+            case 3: delete_medicine(); break;
+            case 4: display_inventory(); break;
+            case 5: search_medicine(); break;
+            case 6: view_shelf_location(); break;
+            case 7: view_sales(); break;
+            case 0: save_data(); save_users(); clear_screen(); free(meds); printf("        Goodbye.\n"); return;
+            default: printf("\n        Invalid choice.\n"); pause_here();
+        }
+    }
+}
+
+void start_menu() {
+    load_data();
+    load_users();
+    while (1) {
+        clear_screen();
+        for (int i=0;i<SCREEN_W;i++) putchar('='); printf("\n        PHARMA TRACK (v5) - WELCOME\n");
+        for (int i=0;i<SCREEN_W;i++) putchar('='); printf("\n\n");
+        printf("        1. Login\n");
+        printf("        2. Register\n");
+        printf("        3. Forgot Password\n");
+        printf("        0. Exit\n\n");
+        printf("        Enter choice: ");
+        int ch;
+        if (scanf("%d", &ch) != 1) { int c; while ((c=getchar())!='\n' && c!=EOF) {} ch = -1; }
+        int c; while ((c=getchar())!='\n' && c!=EOF) {}
+        switch (ch) {
+            case 1: if (login()) { printf("\n        Login successful.\n"); pause_here(); main_menu(); } break;
+            case 2: register_user(); break;
+            case 3: forgot_password(); break;
+            case 0: save_data(); save_users(); clear_screen(); printf("        Bye.\n"); return;
+            default: printf("\n        Invalid choice.\n"); pause_here();
+        }
+    }
+}
+
+/* ---------------- Main ---------------- */
+int main(void) {
+    start_menu();
+    return 0;
+}
